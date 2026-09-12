@@ -1,0 +1,18 @@
+services:
+  migpt:
+    build:
+      context: ../..
+      dockerfile: examples/migpt/Dockerfile
+    image: local/open-xiaoai-migpt:latest
+    container_name: open-xiaoai-migpt
+    restart: unless-stopped
+    environment:
+      MIGPT_SYSTEM_PROMPT: "${MIGPT_SYSTEM_PROMPT:-你是一个智能助手，请根据用户的问题给出回答。}"
+    ports:
+      - "4398:4398"
+      - "4399:4399"
+    volumes:
+      - migpt-data:/data
+
+volumes:
+  migpt-data:

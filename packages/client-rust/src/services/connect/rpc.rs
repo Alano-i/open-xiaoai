@@ -115,11 +115,18 @@ impl RPC {
             payload,
         };
 
-        send_request(request).await?;
-
+        // 先登记 pending 请求，再写入 WebSocket。音箱上的 shell 命令（尤其
+        // mphelper pause）可能在 send 返回后立即完成；如果晚一步登记，响应
+        // 会被 on_response 丢弃，调用方只能等到超时，表现为“偶尔停不住”。
         {
             let mut pending = self.pending_requests.lock().await;
             pending.insert(uid.clone(), tx);
+        }
+
+        if let Err(error) = send_request(request).await {
+            let mut pending = self.pending_requests.lock().await;
+            pending.remove(&uid);
+            return Err(error);
         }
 
         let timeout_duration = Duration::from_millis(timeout_millis.unwrap_or(10 * 1000));

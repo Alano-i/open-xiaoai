@@ -5,7 +5,6 @@ use open_xiaoai::services::connect::data::{Event, Request, Response, Stream};
 use open_xiaoai::services::connect::handler::MessageHandler;
 use open_xiaoai::services::connect::message::{MessageManager, WsStream};
 use open_xiaoai::services::connect::rpc::RPC;
-use open_xiaoai::services::speaker::SpeakerManager;
 use open_xiaoai::utils::task::TaskManager;
 
 use serde_json::json;
@@ -16,9 +15,23 @@ use crate::node::NodeManager;
 
 pub struct AppServer;
 
-async fn test() -> Result<(), AppError> {
-    SpeakerManager::play_text("已连接").await?;
-
+async fn test(address: String) -> Result<(), AppError> {
+    NodeManager::instance()
+        .call_fn::<(), _, _>(
+            "on_event",
+            move |cx| {
+                cx.string(
+                    &serde_json::json!({
+                        "event": "connected",
+                        "data": { "address": address },
+                    })
+                    .to_string(),
+                )
+                .upcast()
+            },
+            |_, _| Ok(()),
+        )
+        .await?;
     // let _ = RPC::instance()
     //     .call_remote("start_recording", None, None)
     //     .await;
@@ -35,10 +48,16 @@ impl AppServer {
     }
 
     pub async fn run() {
-        let addr = "0.0.0.0:4399";
-        let listener = TcpListener::bind(&addr)
-            .await
-            .expect(format!("❌ 绑定地址失败: {}", &addr).as_str());
+        let port = std::env::var("MIGPT_WS_PORT").unwrap_or_else(|_| "4399".to_string());
+        let addr = format!("0.0.0.0:{}", port);
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                // 管理 API 仍可启动，便于在已有 Rust 客户端占用端口时排查配置。
+                println!("❌ 绑定地址失败: {}: {}", addr, error);
+                return;
+            }
+        };
         println!("✅ 已启动: {:?}", addr);
         while let Ok((stream, addr)) = listener.accept().await {
             // 同一时刻只处理一个连接
@@ -52,15 +71,15 @@ impl AppServer {
             return;
         };
         println!("✅ 已连接: {:?}", addr);
-        AppServer::init(ws_stream).await;
+        AppServer::init(ws_stream, addr.to_string()).await;
         if let Err(e) = MessageManager::instance().process_messages().await {
             println!("❌ 消息处理异常: {}", e);
         }
-        AppServer::dispose().await;
+        AppServer::dispose(addr.to_string()).await;
         println!("❌ 已断开连接");
     }
 
-    async fn init(ws_stream: WsStream) {
+    async fn init(ws_stream: WsStream, address: String) {
         MessageManager::instance().init(ws_stream).await;
         MessageHandler::<Event>::instance()
             .set_handler(on_event)
@@ -74,14 +93,30 @@ impl AppServer {
 
         let test = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let _ = test().await;
+            let _ = test(address).await;
         });
         TaskManager::instance().add("test", test).await;
     }
 
-    async fn dispose() {
+    async fn dispose(address: String) {
         MessageManager::instance().dispose().await;
         TaskManager::instance().dispose("test").await;
+        let _ = NodeManager::instance()
+            .call_fn::<(), _, _>(
+                "on_event",
+                move |cx| {
+                    cx.string(
+                        &serde_json::json!({
+                            "event": "disconnected",
+                            "data": { "address": address },
+                        })
+                        .to_string(),
+                    )
+                    .upcast()
+                },
+                |_, _| Ok(()),
+            )
+            .await;
     }
 }
 

@@ -96,8 +96,11 @@ impl AudioRecorder {
                         while accumulated_data.len() >= target_size {
                             let data_to_send =
                                 accumulated_data.drain(..target_size).collect::<Vec<u8>>();
-                            let data_to_send =
-                                transform_stream_chunk(data_to_send, &requested_config, &capture_config);
+                            let data_to_send = transform_stream_chunk(
+                                data_to_send,
+                                &requested_config,
+                                &capture_config,
+                            );
                             if !data_to_send.is_empty() {
                                 let _ = on_stream(data_to_send).await;
                             }

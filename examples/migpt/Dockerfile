@@ -1,64 +1,44 @@
-FROM ubuntu:22.04 AS builder
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+FROM node:22-bookworm AS builder
 
 WORKDIR /app
+
+# 工具链与依赖清单放在源码 COPY 之前。这样修改 TypeScript/Web 页面后，
+# Docker 不会重新下载整套 Ubuntu、Rust、Node 和 npm 依赖，也不会不断堆积
+# 数 GB 的中间层导致构建失败但旧容器继续运行。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY examples/migpt/package.json examples/migpt/pnpm-lock.yaml ./
+COPY examples/migpt/Cargo.toml examples/migpt/Cargo.lock ./
+COPY packages/client-rust/Cargo.toml packages/client-rust/Cargo.lock ./client-rust/
+RUN corepack enable \
+    && corepack install \
+    && pnpm install --frozen-lockfile
 
 COPY examples/migpt .
 COPY packages/client-rust ./client-rust
 
-# 更新源
-RUN apt update && apt install curl build-essential -y
-
-# 安装 Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# Create a script file sourced by both interactive and non-interactive bash shells
-ENV BASH_ENV=/root/.bash_env
-RUN touch "$BASH_ENV"
-RUN echo '. "$BASH_ENV"' >> "$HOME/.bashrc"
-RUN echo '[ -s "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"' >> "$BASH_ENV"
-
-# nvm
-RUN echo 'export NVM_DIR="$HOME/.nvm"' >> "$BASH_ENV"
-RUN echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' >> "$BASH_ENV"
-RUN echo '[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"' >> "$BASH_ENV"
-
-# 安装 Node.js
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
-    && \. $NVM_DIR/nvm.sh && \. $NVM_DIR/bash_completion \
-    && nvm install 22
-
-# 安装依赖
-RUN npm install -g corepack \
-    && corepack enable && corepack install \
-    && pnpm install
-
-# 构建 Rust Server
-RUN sed -i 's/\.\.\/\.\.\/packages\///g' Cargo.toml \
+# 容器构建上下文中 client-rust 位于 /app/client-rust。
+RUN sed -i 's|../../packages/||g' Cargo.toml \
     && pnpm build
 
 
-
-    
-FROM ubuntu:22.04 AS runner
+FROM node:22-bookworm-slim AS runner
 
 WORKDIR /app
 
+ENV MIGPT_WORKDIR=/data
+ENV MIGPT_PORT=4398
+VOLUME ["/data"]
+
 COPY --from=builder /app/migpt /app/migpt
+COPY --from=builder /app/web /app/web
+COPY --from=builder /app/config.ts /app/config.ts
 COPY --from=builder /app/package.json /app/package.json
 COPY --from=builder /app/tsconfig.json /app/tsconfig.json
 COPY --from=builder /app/node_modules /app/node_modules
-
-# 更新源
-RUN apt update && apt install curl build-essential -y
-
-ENV NVM_DIR=/root/.nvm
-
-# 安装 Node.js
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
-    && bash -c "source $NVM_DIR/nvm.sh && nvm install 22"
-
-ENTRYPOINT ["bash", "-c", "source $NVM_DIR/nvm.sh && exec \"$@\"", "--"]
 
 CMD ["npm", "run", "start"]

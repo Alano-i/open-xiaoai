@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
@@ -66,9 +67,25 @@ impl FileMonitor {
 
         let metadata = reader.get_ref().metadata().await.unwrap();
         let mut position = metadata.len();
+        let mut inode = metadata.ino();
 
         loop {
-            let metadata = reader.get_ref().metadata().await.unwrap();
+            // mico_aivs_lab restart 会用新 inode 替换 instruction.log。仅比较
+            // 文件大小无法发现这种情况，旧 reader 会永远读不到新的唤醒/ASR。
+            let metadata = match tokio::fs::metadata(file_path).await {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
+            if metadata.ino() != inode {
+                let file = OpenOptions::new().read(true).open(file_path).await?;
+                reader = BufReader::new(file);
+                inode = metadata.ino();
+                position = 0;
+                let _ = on_update(FileMonitorEvent::NewFile).await;
+            }
 
             let current_size = metadata.len();
             if current_size < position {
@@ -98,5 +115,62 @@ impl FileMonitor {
 
             sleep(Duration::from_millis(10)).await;
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    // 用真实临时文件验证轮转，不依赖音箱或注入语音。先等读循环就绪，
+    // 再原子替换日志，确保新 inode 的第一条指令不会被跳过。
+    #[tokio::test]
+    async fn follows_replaced_log_and_subsequent_appends() {
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let path = directory.join("instruction.log");
+        tokio::fs::write(&path, "history\n").await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut monitor = FileMonitor::new();
+        monitor.start(path.to_str().unwrap(), move |event| {
+            let tx = tx.clone();
+            async move { let _ = tx.send(event); Ok(()) }
+        }).await;
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+                file.write_all(b"ready\n").await.unwrap();
+                sleep(Duration::from_millis(20)).await;
+                if let Ok(FileMonitorEvent::NewLine(line)) = rx.try_recv() {
+                    assert_eq!(line, "ready");
+                    break;
+                }
+            }
+        }).await.expect("监视器没有进入读取循环");
+        let replacement = directory.join("replacement.log");
+        tokio::fs::write(&replacement, "new-first\n").await.unwrap();
+        tokio::fs::rename(&replacement, &path).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(FileMonitorEvent::NewLine(line)) = rx.recv().await {
+                    if line == "new-first" { break; }
+                }
+            }
+        }).await.expect("替换日志后没有读取新文件第一行");
+        let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+        file.write_all(b"new-second\n").await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(FileMonitorEvent::NewLine(line)) = rx.recv().await {
+                    if line == "new-second" { break; }
+                }
+            }
+        }).await.expect("没有读取新日志追加行");
+        monitor.stop().await;
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

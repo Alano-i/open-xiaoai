@@ -7,10 +7,14 @@
   "scripts": {
     "build": "cargo-cp-artifact -ac open_xiaoai_server migpt/open-xiaoai.node -- cargo build --release --message-format=json-render-diagnostics",
     "start": "tsx migpt/index.ts",
-    "dev": "pnpm build && pnpm start"
+    "dev": "pnpm build && pnpm start",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test migpt/*.test.ts migpt/**/*.test.ts"
   },
   "dependencies": {
+    "@mi-gpt/chat": "1.1.1",
     "@mi-gpt/engine": "1.2.1",
+    "@mi-gpt/openai": "1.1.1",
     "@mi-gpt/utils": "1.1.1"
   },
   "devDependencies": {

@@ -177,7 +177,15 @@ impl MessageManager {
                     .on_response(response)
                     .await
             }
-            AppMessage::Event(event) => MessageHandler::<Event>::instance().on(event).await,
+            AppMessage::Event(event) => {
+                // VAD 抢麦会执行远程 RPC，不能阻塞 WebSocket 读循环，否则随后
+                // 到达的 FINAL ASR 无法及时读取，第二条指令就会被吞掉。
+                self.run_concurrently(move || {
+                    let event = event.clone();
+                    async move { MessageHandler::<Event>::instance().on(event).await }
+                })
+                .await
+            }
             _ => Ok(()),
         }
     }

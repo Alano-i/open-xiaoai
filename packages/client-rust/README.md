@@ -17,10 +17,11 @@
 mkdir /data/open-xiaoai
 
 # 设置 server 地址（注意替换成自己的 server 地址）
+# 局域网直连使用 ws://；HTTPS 反向代理使用 wss://
 echo 'ws://192.168.31.227:4399' > /data/open-xiaoai/server.txt
 
-# 运行启动脚本 init.sh
-curl -sSfL https://gitee.com/idootop/artifacts/releases/download/open-xiaoai-client/init.sh | sh
+# 运行本项目的启动脚本 init.sh
+curl -sSfL https://raw.githubusercontent.com/Alano-i/open-xiaoai/main/packages/client-rust/init.sh | sh
 ```
 
 > [!IMPORTANT]
@@ -31,14 +32,37 @@ curl -sSfL https://gitee.com/idootop/artifacts/releases/download/open-xiaoai-cli
 如果你想要开机自启动，运行以下命令重启小爱音箱即可。
 
 ```shell
-# 下载 boot.sh 文件到 /data/init.sh 开机时自启动
-curl -L -o /data/init.sh https://gitee.com/idootop/artifacts/releases/download/open-xiaoai-client/boot.sh
+# 下载本项目的 boot.sh 到 /data/init.sh 开机时自启动
+curl -L -o /data/init.sh https://raw.githubusercontent.com/Alano-i/open-xiaoai/main/packages/client-rust/boot.sh
 
 # 重启小爱音箱
 reboot
 ```
 
 ## 编译运行
+
+### 一键编译并安装
+
+在项目根目录执行以下命令，可以自动交叉编译 Client、上传到小爱音箱，更新
+`/data/open-xiaoai/server.txt`，并将最新的 `init.sh` 安装到 `/data/init.sh`：
+
+```shell
+make client
+```
+
+首次使用时，先复制配置模板并填写音箱 IP、MiGPT WebSocket 地址和 SSH 登录信息：
+
+```shell
+cp packages/client-rust/.env.example packages/client-rust/.env
+# 编辑 packages/client-rust/.env
+make client
+```
+
+`make client` 会自动读取 `packages/client-rust/.env`；命令行环境变量可以覆盖其中的同名配置。
+如果没有填写必要配置，脚本会交互询问。
+
+默认上传完成后会重启音箱，使新 Client 和 `/data/init.sh` 立即生效。仅上传不重启可设置
+`REBOOT=0`，但旧 Client 进程会继续运行到下次重启。
 
 > [!TIP]
 > 如果你是一名开发者，想要修改源代码实现自己想要的功能，可以按照下面的步骤，自行编译运行该项目。
@@ -75,6 +99,17 @@ dd if=target/armv7-unknown-linux-gnueabihf/release/client \
 | ssh -o HostKeyAlgorithms=+ssh-rsa root@你的小爱音箱IP地址 "dd of=/data/open-xiaoai/client"
 ```
 
+覆盖正在运行的文件不会更新已经加载到内存中的旧进程。复制完成后必须重启
+Client（或重启音箱），否则唤醒抢麦和“停止”逻辑仍然是旧版本：
+
+```shell
+ssh -o HostKeyAlgorithms=+ssh-rsa root@你的小爱音箱IP地址 \
+  'pid=$(cat /data/open-xiaoai/client.pid 2>/dev/null || true); \
+   [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true; \
+   start-stop-daemon -S -b -m -p /data/open-xiaoai/client.pid \
+     -x /data/open-xiaoai/client -- ws://你的 server 地址:4399'
+```
+
 > [!TIP]
 > 注意替换你自己的小爱音箱局域网 IP 地址，比如： root@192.168.31.227
 >
@@ -103,6 +138,7 @@ chmod +x /data/open-xiaoai/client
 /data/open-xiaoai/client ws://你的 server 端地址（默认使用 4399 端口）
 
 # 比如：/data/open-xiaoai/client ws://192.168.31.227:4399
+# 或：/data/open-xiaoai/client wss://mi.example.com
 ```
 
 ## 注意事项

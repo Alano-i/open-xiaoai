@@ -95,7 +95,8 @@ impl AudioPlayer {
             while let Some(bytes) = rx.recv().await {
                 let mut write_guard = write_thread_clone.lock().await;
                 if let Some(write_thread) = write_guard.as_mut() {
-                    let _ = timeout(Duration::from_millis(100), write_thread.write_all(&bytes)).await;
+                    let _ =
+                        timeout(Duration::from_millis(100), write_thread.write_all(&bytes)).await;
                 } else {
                     break;
                 }

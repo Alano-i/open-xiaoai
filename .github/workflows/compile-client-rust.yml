@@ -1,10 +1,6 @@
 name: Compile Client Rust
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'packages/client-rust/**'
   pull_request:
     branches: [ main ]
     paths:

@@ -9,6 +9,7 @@
 # MiGPT
 !examples/migpt/src
 !examples/migpt/migpt
+!examples/migpt/web
 !examples/migpt/config.ts
 !examples/migpt/package.json
 !examples/migpt/pnpm-lock.yaml
