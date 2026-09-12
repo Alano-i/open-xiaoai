@@ -37,7 +37,9 @@ VERSION=$(tr -d '\r\n' < "$ASSETS_DIR/.version")
 [[ "$MODEL" == "OH2P" ]] || die "检测到型号 $MODEL，本目标只允许构建 OH2P 固件"
 [[ -n "$VERSION" ]] || die "固件版本为空"
 
-FIRMWARE_DIR=$(find "$ASSETS_DIR" -mindepth 2 -maxdepth 2 -type f -name root-patched.squashfs -print | sort | tail -n 1 | xargs -r dirname)
-[[ -n "$FIRMWARE_DIR" && -f "$FIRMWARE_DIR/root.squashfs" ]] || die "找不到重新打包后的 OH2P 固件文件"
+FIRMWARE_PATH=$(find "$ASSETS_DIR" -mindepth 2 -maxdepth 2 -type f -name root-patched.squashfs -print | sort | tail -n 1)
+[[ -n "$FIRMWARE_PATH" ]] || die "找不到重新打包后的 OH2P 固件文件"
+FIRMWARE_DIR=$(dirname "$FIRMWARE_PATH")
+[[ -f "$FIRMWARE_DIR/root.squashfs" ]] || die "找不到重新打包后的 OH2P 固件文件"
 
 echo "✅ OH2P 固件构建完成：${FIRMWARE_DIR}（版本：${VERSION}）"

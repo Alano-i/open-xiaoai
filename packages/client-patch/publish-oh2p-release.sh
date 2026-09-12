@@ -21,8 +21,9 @@ VERSION=$(tr -d '\r\n' < "$ASSETS_DIR/.version")
 [[ "$MODEL" == "OH2P" ]] || die "检测到型号 $MODEL，本目标只发布 OH2P 固件"
 [[ -n "$VERSION" ]] || die "固件版本为空"
 
-FIRMWARE_DIR=$(find "$ASSETS_DIR" -mindepth 2 -maxdepth 2 -type f -name root-patched.squashfs -print | sort | tail -n 1 | xargs -r dirname)
-[[ -n "$FIRMWARE_DIR" ]] || die "找不到 root-patched.squashfs，请先执行 make img"
+FIRMWARE_PATH=$(find "$ASSETS_DIR" -mindepth 2 -maxdepth 2 -type f -name root-patched.squashfs -print | sort | tail -n 1)
+[[ -n "$FIRMWARE_PATH" ]] || die "找不到 root-patched.squashfs，请先执行 make img"
+FIRMWARE_DIR=$(dirname "$FIRMWARE_PATH")
 [[ -f "$FIRMWARE_DIR/root.squashfs" ]] || die "找不到原版 root.squashfs"
 
 ORIGINAL="$ASSETS_DIR/OH2P_${VERSION}.squashfs"
