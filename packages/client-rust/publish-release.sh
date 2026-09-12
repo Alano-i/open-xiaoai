@@ -26,7 +26,7 @@ gh auth status >/dev/null 2>&1 || die "GitHub CLI 未登录，请先执行 gh au
 REPO="${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)}"
 [[ -n "$REPO" ]] || die "无法确定 GitHub 仓库，请设置 GH_REPO（例如 Alano-i/open-xiaoai）"
 
-echo "🔨 正在编译 Client（目标：$TARGET）..."
+echo "🔨 正在编译 Client（目标：${TARGET}）..."
 cross build --release --target "$TARGET" --manifest-path "$CLIENT_DIR/Cargo.toml"
 [[ -x "$CLIENT_BIN" ]] || die "编译完成但找不到可执行文件：$CLIENT_BIN"
 

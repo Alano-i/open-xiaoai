@@ -20,7 +20,7 @@ command -v docker >/dev/null 2>&1 || die "未找到 Docker，请先安装 Docker
 [[ -f "$ENV_FILE" ]] || die "找不到配置文件：$ENV_FILE，请先复制 .env.example 并填写小米账号信息"
 mkdir -p "$ASSETS_DIR" "$PATCHES_DIR"
 
-echo "🐳 正在构建固件工具镜像：$IMAGE（平台：$PLATFORM）..."
+echo "🐳 正在构建固件工具镜像：${IMAGE}（平台：${PLATFORM}）..."
 docker build --platform "$PLATFORM" -t "$IMAGE" -f "$PATCH_DIR/Dockerfile" "$PATCH_DIR"
 
 echo "🔥 正在构建 OH2P 补丁固件..."
@@ -40,4 +40,4 @@ VERSION=$(tr -d '\r\n' < "$ASSETS_DIR/.version")
 FIRMWARE_DIR=$(find "$ASSETS_DIR" -mindepth 2 -maxdepth 2 -type f -name root-patched.squashfs -print | sort | tail -n 1 | xargs -r dirname)
 [[ -n "$FIRMWARE_DIR" && -f "$FIRMWARE_DIR/root.squashfs" ]] || die "找不到重新打包后的 OH2P 固件文件"
 
-echo "✅ OH2P 固件构建完成：$FIRMWARE_DIR（版本：$VERSION）"
+echo "✅ OH2P 固件构建完成：${FIRMWARE_DIR}（版本：${VERSION}）"
