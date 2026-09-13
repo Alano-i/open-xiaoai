@@ -147,7 +147,12 @@ class OpenXiaoAIEngine extends MiGPTEngine {
     Object.assign(controlConfig, persisted, { openai: { ...controlConfig.openai, ...persisted.openai }, prompt: { ...controlConfig.prompt, ...persisted.prompt } });
     this.podcastController.updateApi({ baseUrl: controlConfig.podsuiteUrl, token: controlConfig.podsuiteToken });
     Object.assign(this.config, { openai: controlConfig.openai, prompt: controlConfig.prompt });
-    ChatBot.init(this.config);
+    this.reinitializeChatBot();
+    console.log("🤖 AI 配置已加载", {
+      baseURLConfigured: Boolean(controlConfig.openai.baseURL?.trim()),
+      model: controlConfig.openai.model || "(未配置)",
+      apiKeyConfigured: Boolean(controlConfig.openai.apiKey?.trim()),
+    });
     this.controlServer = new ControlServer(
       controlConfig,
       configStore,
@@ -158,11 +163,30 @@ class OpenXiaoAIEngine extends MiGPTEngine {
       (next) => {
         this.podcastController?.updateApi({ baseUrl: next.podsuiteUrl, token: next.podsuiteToken });
         Object.assign(this.config, { openai: next.openai, prompt: next.prompt });
-        ChatBot.init(this.config);
+        this.reinitializeChatBot();
+        console.log("🤖 AI 配置已更新", {
+          baseURLConfigured: Boolean(next.openai.baseURL?.trim()),
+          model: next.openai.model || "(未配置)",
+          apiKeyConfigured: Boolean(next.openai.apiKey?.trim()),
+        });
       },
       () => ({ ...this.connection, device: this.connection.device && { ...this.connection.device } }),
     );
     this.controlServer.listen();
+  }
+
+  /**
+   * 重新创建 OpenAI 客户端。
+   *
+   * MiGPT 引擎启动时会先用代码中的空配置初始化一次 ChatBot，而
+   * @mi-gpt/openai 的 init() 为了复用连接只会创建一次客户端（`??=`）。
+   * 如果随后才从 /data/config.json 读取 Web 配置，旧客户端就会继续使用
+   * api.openai.com 和空 API Key。先 dispose OpenAI 客户端，再初始化 ChatBot，
+   * 才能让管理页面保存的 baseURL/API Key 真正生效，同时保留对话历史。
+   */
+  private reinitializeChatBot() {
+    OpenAI.dispose();
+    ChatBot.init(this.config);
   }
 
   /**
