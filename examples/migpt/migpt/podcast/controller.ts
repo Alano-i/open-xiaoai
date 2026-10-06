@@ -91,6 +91,15 @@ export class PodcastController {
     this.api.updateConfig(config);
   }
 
+  /** 管理页联想与待播清单直接读取 PodSuite，MiGPT 只负责转发和鉴权。 */
+  suggestPodcasts(query: string) {
+    return this.api.suggestPodcasts(query);
+  }
+
+  upcomingEpisodes(episodeId: string, limit?: number) {
+    return this.api.getUpcoming(episodeId, limit);
+  }
+
   async history(limit = 100) {
     const entries = (await this.api.getHistory()).slice(0, limit);
     return Promise.all(entries.map(async (entry) => {

@@ -80,6 +80,16 @@ export class PodcastApiClient {
     return result;
   }
 
+  /** 管理页“点播节目”联想：名称、拼音首字母、全拼、作者/主播。 */
+  suggestPodcasts(query: string) {
+    return this.request<Array<Record<string, unknown>>>(`/api/integrations/migpt/v1/podcasts/suggest?q=${encodeURIComponent(query)}`);
+  }
+
+  /** 管理页“待播清单”：当前节目之后的若干集。 */
+  getUpcoming(episodeId: string, limit = 50) {
+    return this.request<Array<Record<string, unknown>>>(`/api/integrations/migpt/v1/episodes/${encodeURIComponent(episodeId)}/upcoming?limit=${limit}`);
+  }
+
   getEpisode(episodeId: string) {
     return this.request<Episode>(`/api/integrations/migpt/v1/episodes/${encodeURIComponent(episodeId)}`);
   }

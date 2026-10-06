@@ -22,7 +22,21 @@ export interface MigptRuntimeConfig {
 
 type ConfigPatch = Partial<MigptRuntimeConfig> & { openai?: Partial<MigptRuntimeConfig["openai"]>; prompt?: Partial<MigptRuntimeConfig["prompt"]> };
 
-const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript" };
+// 管理页由 PodSuite 助手页源码构建，产物包含字体、图标等静态资源。
+const MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".webp": "image/webp",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+};
 
 export class ControlServer {
   private readonly server;
@@ -104,6 +118,15 @@ export class ControlServer {
         return this.json(response, 201, device);
       }
     }
+    if (url.pathname === "/api/migpt/v1/podcasts/suggest" && request.method === "GET") {
+      const query = (url.searchParams.get("q") || "").slice(0, 100);
+      return this.forwardPodsuite(response, () => this.controller.suggestPodcasts(query));
+    }
+    const upcoming = url.pathname.match(/^\/api\/migpt\/v1\/episodes\/([^/]+)\/upcoming$/);
+    if (upcoming && request.method === "GET") {
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+      return this.forwardPodsuite(response, () => this.controller.upcomingEpisodes(decodeURIComponent(upcoming[1] || ""), limit));
+    }
     if (url.pathname === "/api/migpt/v1/conversations" && request.method === "GET") return this.json(response, 200, this.conversations.list());
     if (url.pathname === "/api/migpt/v1/playback/history" && request.method === "GET") {
       return this.json(response, 200, await this.controller.history());
@@ -155,6 +178,16 @@ export class ControlServer {
     return this.static(url.pathname, response);
   }
 
+  /** 转发 PodSuite 查询；PodSuite 未配置或不可用时返回 502 和具体原因，而不是笼统的“请求格式无效”。 */
+  private async forwardPodsuite(response: ServerResponse, load: () => Promise<unknown>) {
+    try {
+      return this.json(response, 200, await load());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.json(response, 502, { error: `读取 PodSuite 失败：${message}` });
+    }
+  }
+
   private publicConfig() {
     return { ...this.config, apiToken: this.config.apiToken ? "********" : "", podsuiteToken: this.config.podsuiteToken ? "********" : "", openai: { ...this.config.openai, apiKey: this.config.openai.apiKey ? "********" : "" } };
   }
@@ -202,7 +235,9 @@ export class ControlServer {
     if (fileRelative === ".." || fileRelative.startsWith(`..${sep}`)) return this.json(response, 403, { error: "禁止访问" });
     try {
       const body = await readFile(file);
-      response.writeHead(200, { "Content-Type": MIME[extname(file)] || "application/octet-stream" });
+      // 构建产物 assets/ 下的文件名带内容哈希，可长期缓存；index.html 必须每次重新获取。
+      const cacheControl = fileRelative.startsWith(`assets${sep}`) ? "public, max-age=31536000, immutable" : "no-cache";
+      response.writeHead(200, { "Content-Type": MIME[extname(file)] || "application/octet-stream", "Cache-Control": cacheControl });
       response.end(body);
     } catch (_) { this.json(response, 404, { error: "Not found" }); }
   }
