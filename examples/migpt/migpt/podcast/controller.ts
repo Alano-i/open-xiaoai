@@ -13,6 +13,8 @@ export interface PodcastSpeaker {
   getPlaying(sync?: boolean): Promise<"playing" | "paused" | "idle">;
   getPlaybackContext(): Promise<Record<string, unknown>>;
   seek(positionMs: number): Promise<boolean>;
+  /** 管理页调节音量用；播客控制流程本身不依赖。 */
+  setVolume?(volume: number): Promise<boolean>;
   suppressMicEcho?: (milliseconds?: number, text?: string) => void;
 }
 
@@ -25,6 +27,8 @@ export interface PodcastHandleResult {
   text?: string;
   /** 是否需要由 MiGPT 主消息队列播报 text；HTTP 控制调用也可忽略。 */
   speak?: boolean;
+  /** 指令未能执行（找不到节目、播放失败等）。管理页据此显示警告而不是成功提示。 */
+  failed?: boolean;
 }
 
 interface LocalState {
@@ -148,7 +152,7 @@ export class PodcastController {
       }
     } catch (error) {
       console.error("❌ 播客指令处理失败", error);
-      return this.reply("播客服务暂时不可用，请稍后再试。", true);
+      return this.fail("播客服务暂时不可用，请稍后再试。");
     }
   }
 
@@ -258,8 +262,26 @@ export class PodcastController {
       const result = await this.api.resolveEpisode(intent.query, intent.season ?? 1, intent.episode);
       if (result && !Array.isArray(result)) episode = result;
     }
-    if (!episode) return this.reply("没有找到这个播客，请检查播客名称或季集。", true);
+    if (!episode) return this.fail("没有找到这个播客，请检查播客名称或季集。");
     return this.startEpisode(episode, intent.fromStart);
+  }
+
+  /**
+   * 管理页“待播清单”按单集 ID 精确点播。按名称点播会把“斗罗大陆”同时匹配到
+   * 斗罗大陆 2/3/4，因此网页已知具体节目时不能再走名称解析。
+   */
+  async playEpisode(episodeId: string): Promise<PodcastHandleResult> {
+    try {
+      const episode = await this.api.getEpisode(episodeId).catch(() => undefined);
+      if (!episode) return this.fail("没有找到这一集，可能已从 PodSuite 移除。");
+      state.pendingQuery = undefined;
+      state.pendingSeason = undefined;
+      state.pendingEpisode = undefined;
+      return await this.startEpisode(episode);
+    } catch (error) {
+      console.error("❌ 按节目 ID 播放失败", error);
+      return this.fail("播放失败，请稍后重试。");
+    }
   }
 
   private async startEpisode(episode: Episode, fromStart = false, announce = true) {
@@ -282,7 +304,7 @@ export class PodcastController {
       audioId: episode.episode_id,
       durationMs: episode.duration_ms,
     });
-    if (!played) return this.reply("音频播放失败，请检查音箱和播客地址。", true);
+    if (!played) return this.fail("音频播放失败，请检查音箱和播客地址。");
     // player_play_music 返回时媒体可能还未装载；等待目标 audio_id 出现后再 seek。
     // 新节目从头播放无需等待播放器上下文；只有续播时才需要轮询并 seek。
     const context = position > 0 ? await this.preparePlayback(episode.episode_id, position) : undefined;
@@ -290,6 +312,23 @@ export class PodcastController {
     const duration = reportedDuration && reportedDuration > 0 ? reportedDuration : episode.duration_ms ?? undefined;
     if (duration) this.scheduleCompletion(position, duration);
     return { handled: true };
+  }
+
+  /**
+   * 网页拖动进度条后的跳转。直接调用 speaker.seek 不会更新完播检测，
+   * 拖到结尾附近时会错过自动下一集；这里跳转后保存断点并按新位置重新计时。
+   */
+  async seek(positionMs: number) {
+    const target = Math.max(0, Math.round(positionMs));
+    const success = await this.speaker.seek(target).catch(() => false);
+    const current = state.current;
+    if (!success || !current) return { success };
+    const status = await this.speaker.getPlaying(true);
+    const progress = await this.saveCurrentProgress(status === "playing" ? "playing" : "paused");
+    const duration = progress?.duration_ms ?? current.duration_ms;
+    if (status === "playing" && duration) this.scheduleCompletion(target, duration);
+    else this.cancelCompletion();
+    return { success };
   }
 
   private async preparePlayback(episodeId: string, positionMs: number) {
@@ -329,7 +368,7 @@ export class PodcastController {
 
   private async resume() {
     await this.ensureCurrent();
-    if (!state.current || state.current.progress?.status === "completed") return this.reply("当前没有可继续播放的播客。", true);
+    if (!state.current || state.current.progress?.status === "completed") return this.fail("当前没有可继续播放的播客。");
     const status = await this.speaker.getPlaying(true);
     if (status === "idle") {
       return this.play({
@@ -359,13 +398,13 @@ export class PodcastController {
 
   private async restart() {
     await this.ensureCurrent();
-    if (!state.current) return this.reply("当前没有正在播放的播客。", true);
+    if (!state.current) return this.fail("当前没有正在播放的播客。");
     return this.play({ type: "play", query: state.current.podcast_title, season: state.current.season, episode: state.current.episode, fromStart: true });
   }
 
   private async adjacent(direction: 1 | -1) {
     await this.ensureCurrent();
-    if (!state.current) return this.reply("当前没有正在播放的播客。", true);
+    if (!state.current) return this.fail("当前没有正在播放的播客。");
     const current = state.current;
     // 优先使用搜索接口按季集获取目标节目，避免 getEpisode(id) 在远程服务上
     // 约 5 秒的详情查询延迟；若节目编号不连续，再回退到 next/previous id。
@@ -374,7 +413,7 @@ export class PodcastController {
     let episode = !Array.isArray(searched) ? searched : undefined;
     if (!episode) {
       const nextId = direction > 0 ? current.next_episode_id : current.previous_episode_id;
-      if (!nextId) return this.reply(direction > 0 ? "已经是最后一集了。" : "已经是第一集了。", true);
+      if (!nextId) return this.fail(direction > 0 ? "已经是最后一集了。" : "已经是第一集了。");
       episode = await this.api.getEpisode(nextId);
     }
     return this.startEpisode(episode, false, false);
@@ -388,7 +427,7 @@ export class PodcastController {
   }
 
   private async setTimer(minutes: number) {
-    if (minutes <= 0) return this.reply("定时时间必须大于零。", true);
+    if (minutes <= 0) return this.fail("定时时间必须大于零。");
     if (timer) clearTimeout(timer);
     state.timerUntil = Date.now() + minutes * 60_000;
     timer = setTimeout(async () => {
@@ -508,6 +547,11 @@ export class PodcastController {
     });
     this.speechTail = job.catch(() => undefined);
     return job;
+  }
+
+  /** 指令未执行时的回复：照常播报给音箱，同时标记 failed 供管理页区分提示样式。 */
+  private fail(text: string): PodcastHandleResult {
+    return { ...this.reply(text, true), failed: true };
   }
 
   private reply(text: string, speak = true) {

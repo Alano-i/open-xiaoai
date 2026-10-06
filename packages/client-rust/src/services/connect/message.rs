@@ -3,6 +3,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::future::Future;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_tungstenite::MaybeTlsStream;
@@ -29,6 +30,19 @@ pub enum WsWriter {
     Server(SplitSink<WebSocketStream<TcpStream>, Message>),
     Client(SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>),
 }
+
+/// 客户端心跳间隔：定期调用服务端的 get_version RPC，确认 MiGPT 本身仍在线。
+///
+/// 不能只用 WebSocket Ping：音箱经 Lucky 反向代理和 EasyTier 连到 MiGPT 时，
+/// MiGPT 重启后中间链路仍会回 Pong（实测约 170 秒后才断开），客户端误以为连接正常。
+/// RPC 必须由 MiGPT 应用层处理并回复，中间链路无法代答。
+const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 单次心跳等待服务端回复的超时（毫秒）。
+const CLIENT_HEARTBEAT_TIMEOUT_MS: u64 = 10_000;
+
+/// 连续多少次心跳无回复判定连接失效，避免一次偶发延迟就触发重连。
+const CLIENT_HEARTBEAT_MAX_FAILURES: u32 = 2;
 
 pub struct MessageManager {
     semaphore: Arc<Semaphore>,
@@ -121,11 +135,53 @@ impl MessageManager {
             return Err("WebSocket reader is not initialized".into());
         }
 
+        // 只有作为客户端（音箱端）时才做心跳检测；服务端保持原有行为。
+        let is_client = matches!(&*self.reader.lock().await, Some(WsReader::Client(_)));
+        if !is_client {
+            return self.read_loop().await;
+        }
+        tokio::select! {
+            result = self.read_loop() => result,
+            _ = Self::wait_heartbeat_lost() => Err(format!(
+                "连续 {} 次心跳（get_version）无回复，MiGPT 可能已重启或连接已失效，准备重连",
+                CLIENT_HEARTBEAT_MAX_FAILURES
+            )
+            .into()),
+        }
+    }
+
+    /// 定期调用服务端 RPC；连续失败达到阈值时返回，由调用方断开并重连。
+    async fn wait_heartbeat_lost() {
+        let mut failures = 0;
+        let mut interval = tokio::time::interval(CLIENT_HEARTBEAT_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match RPC::instance()
+                .call_remote("get_version", None, Some(CLIENT_HEARTBEAT_TIMEOUT_MS))
+                .await
+            {
+                Ok(_) => failures = 0,
+                Err(error) => {
+                    failures += 1;
+                    eprintln!(
+                        "⚠️ 心跳无回复（第 {}/{} 次）：{}",
+                        failures, CLIENT_HEARTBEAT_MAX_FAILURES, error
+                    );
+                    if failures >= CLIENT_HEARTBEAT_MAX_FAILURES {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn read_loop(&self) -> Result<(), AppError> {
         loop {
             let next_msg = {
                 let mut reader = self.reader.lock().await;
                 match reader.as_mut() {
-                    None => break,
+                    None => None,
                     Some(WsReader::Client(reader)) => reader.next().await,
                     Some(WsReader::Server(reader)) => reader.next().await,
                 }

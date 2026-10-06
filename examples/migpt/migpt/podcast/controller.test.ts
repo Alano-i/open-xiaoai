@@ -250,3 +250,91 @@ test("唯一的全局集号直接播放，重号时追问季数", async () => {
   assert.equal(controller.current?.season, 5);
   assert.deepEqual(resolved.slice(-2), [[undefined, 503], [5, 503]]);
 });
+
+test("网页拖动进度条跳转后保存断点", async () => {
+  const episode: Episode = {
+    episode_id: "episode-1",
+    podcast_id: "podcast-1",
+    podcast_title: "示例播客",
+    title: "第1集",
+    season: 1,
+    episode: 1,
+    audio_url: "https://example.com/episode-1.mp3",
+    duration_ms: 120_000,
+    progress: null,
+  };
+  const saved: Progress[] = [];
+  const api = {
+    async resolveEpisode() { return episode; },
+    async getCurrentProgress() { return null; },
+    async saveProgress(episodeId: string, progress: Omit<Progress, "episode_id">) {
+      const result = { episode_id: episodeId, ...progress };
+      saved.push(result);
+      return result;
+    },
+  } as unknown as PodcastApiClient;
+  let position = 0;
+  const seeks: number[] = [];
+  const speaker: PodcastSpeaker = {
+    async abortXiaoAI() { return true; },
+    async play() { return true; },
+    async setPlaying() { return true; },
+    async stop() { return true; },
+    async getPlaying() { return "playing"; },
+    async getPlaybackContext() { return { position, duration: 120_000 }; },
+    async seek(positionMs) { seeks.push(positionMs); position = positionMs; return true; },
+  };
+  const controller = new PodcastController(api, speaker);
+
+  await controller.handle("播放播客示例播客第1集");
+  assert.deepEqual(await controller.seek(90_400.6), { success: true });
+  assert.equal(seeks.at(-1), 90_401);
+  assert.equal(saved.at(-1)?.position_ms, 90_401);
+  assert.equal(saved.at(-1)?.status, "playing");
+
+  assert.deepEqual(await controller.seek(-10), { success: true });
+  assert.equal(seeks.at(-1), 0);
+});
+
+test("待播清单按节目 ID 精确播放", async () => {
+  const episode: Episode = {
+    episode_id: "episode-9",
+    podcast_id: "podcast-2",
+    podcast_title: "斗罗大陆2",
+    title: "第9集",
+    season: 1,
+    episode: 9,
+    audio_url: "https://example.com/episode-9.mp3",
+    duration_ms: 60_000,
+    progress: null,
+  };
+  const requested: string[] = [];
+  const api = {
+    async getEpisode(id: string) {
+      requested.push(id);
+      if (id !== episode.episode_id) throw new Error("not found");
+      return episode;
+    },
+    async saveProgress(episodeId: string, progress: Omit<Progress, "episode_id">) { return { episode_id: episodeId, ...progress }; },
+  } as unknown as PodcastApiClient;
+  const playCalls: Array<Record<string, unknown>> = [];
+  const speaker: PodcastSpeaker = {
+    async abortXiaoAI() { return true; },
+    async play(options) { playCalls.push(options); return true; },
+    async setPlaying() { return true; },
+    async stop() { return true; },
+    async getPlaying() { return "playing"; },
+    async getPlaybackContext() { return {}; },
+    async seek() { return true; },
+  };
+  const controller = new PodcastController(api, speaker);
+
+  assert.equal((await controller.playEpisode("episode-9")).handled, true);
+  assert.equal(controller.current?.episode_id, "episode-9");
+  assert.equal(playCalls.at(-1)?.url, episode.audio_url);
+
+  const missing = await controller.playEpisode("missing");
+  assert.match(String(missing.text), /没有找到这一集/);
+  assert.equal(missing.failed, true);
+  assert.deepEqual(requested, ["episode-9", "missing"]);
+});

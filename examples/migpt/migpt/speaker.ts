@@ -146,6 +146,18 @@ class SpeakerManager implements ISpeaker {
   }
 
   /**
+   * 设置音箱音量（0-100）。OH2P 1.62.2 实机验证：player_set_volume 立即生效，
+   * player_get_play_status 的 volume 同步变化；get_media_volume 返回的是底层刻度，不能当百分比用。
+   */
+  async setVolume(volume: number) {
+    const value = Math.min(100, Math.max(0, Math.round(volume)));
+    const res = await this.runShell(
+      `ubus call mediaplayer player_set_volume ${shellQuote(jsonEncode({ volume: value, media: "app_ios" }))}`
+    );
+    return res?.stdout.includes('"code": 0') ?? false;
+  }
+
+  /**
    * 播放文字、音频链接、音频流
    */
   async play({

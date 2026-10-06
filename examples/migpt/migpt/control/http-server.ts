@@ -111,7 +111,8 @@ export class ControlServer {
     if (url.pathname.startsWith("/api/migpt/v1/player/")) {
       const command = url.pathname.split("/").pop();
       if (request.method === "POST" && command === "play") {
-        const body = await this.body<{ query?: string; season?: number; episode?: number }>(request);
+        const body = await this.body<{ episode_id?: string; query?: string; season?: number; episode?: number }>(request);
+        if (body.episode_id) return this.json(response, 200, await this.controller.playEpisode(String(body.episode_id)));
         if (body.query) {
           const selection = `${body.query}${body.season ? `第${body.season}季` : ""}${body.episode ? `第${body.episode}集` : ""}`;
           return this.json(response, 200, await this.controller.handle(`播放播客${selection}`));
@@ -120,7 +121,13 @@ export class ControlServer {
       }
       if (request.method === "POST" && command === "seek") {
         const body = await this.body<{ position_ms?: number }>(request);
-        return this.json(response, 200, { success: await this.speaker.seek(Number(body.position_ms || 0)) });
+        return this.json(response, 200, await this.controller.seek(Number(body.position_ms || 0)));
+      }
+      if (request.method === "POST" && command === "volume") {
+        const body = await this.body<{ volume?: number }>(request);
+        const volume = Number(body.volume);
+        if (!Number.isFinite(volume)) return this.json(response, 400, { error: "音量必须是 0-100 的数字" });
+        return this.json(response, 200, { success: await this.speaker.setVolume?.(volume) ?? false });
       }
       const commands: Record<string, string> = { pause: "暂停播客", resume: "继续播放", stop: "停止播客", next: "播放下一集", previous: "播放上一集", restart: "从头播放播客" };
       if (request.method === "POST" && command && commands[command]) {

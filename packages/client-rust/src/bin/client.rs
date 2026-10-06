@@ -20,6 +20,9 @@ use open_xiaoai::services::monitor::playing::PlayingMonitor;
 use open_xiaoai::utils::shell::run_shell as run_local_shell;
 use serde_json::Value;
 
+/// 单次建立 WebSocket 连接（含 TLS 握手和协议升级）的最长等待时间。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct AppClient {
     kws_monitor: KwsMonitor,
     instruction_monitor: InstructionMonitor,
@@ -35,8 +38,13 @@ impl AppClient {
         }
     }
 
+    /// 建立连接加超时：经 Lucky 反向代理和 EasyTier 转发时，MiGPT 正在重启的那段时间里，
+    /// EasyTier 会先代答 TCP 握手，导致 WebSocket 升级请求一直等不到回复（实测卡住 2~3 分钟）。
+    /// 超时后放弃本次连接重新发起，MiGPT 启动完成后即可在十几秒内连上。
     pub async fn connect(&self, url: &str) -> Result<WsStream, AppError> {
-        let (ws_stream, _) = connect_async(url).await?;
+        let (ws_stream, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
+            .await
+            .map_err(|_| format!("{} 秒内未完成连接", CONNECT_TIMEOUT.as_secs()))??;
         Ok(WsStream::Client(ws_stream))
     }
 
