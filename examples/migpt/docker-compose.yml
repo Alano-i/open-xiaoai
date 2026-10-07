@@ -16,3 +16,16 @@ services:
 
 volumes:
   migpt-data:
+
+  
+# 实际部署请使用以下compose
+# services:
+#   migpt:
+#     image: alanoo/migpt:latest
+#     container_name: migpt
+#     restart: unless-stopped
+#     ports:
+#       - '4398:4398'
+#       - '4399:4399'
+#     volumes:
+#       - /mnt/app/appdata/migpt:/data

@@ -85,6 +85,23 @@ export class PodcastController {
   }
 
   get current() { return state.current; }
+
+  private restoreCheckedAt = 0;
+
+  /**
+   * 状态接口使用的当前节目。MiGPT 重启后内存中没有当前节目，但“继续播放”会通过 ensureCurrent
+   * 从 PodSuite 最近一条未完成记录恢复并续播；这里用同一逻辑恢复，让管理页显示的就是点播放键
+   * 会播的那一集。状态每 5 秒轮询一次：最多等待 2 秒，没有记录时 30 秒内不重复查询 PodSuite。
+   */
+  async currentForStatus() {
+    if (state.current) return state.current;
+    if (Date.now() - this.restoreCheckedAt < 30_000) return undefined;
+    this.restoreCheckedAt = Date.now();
+    return Promise.race([
+      this.ensureCurrent().catch(() => undefined),
+      sleep(2_000).then(() => undefined),
+    ]);
+  }
   get timerUntil() { return state.timerUntil; }
 
   updateApi(config: { baseUrl: string; token?: string }) {

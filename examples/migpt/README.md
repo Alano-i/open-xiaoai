@@ -27,21 +27,17 @@ OpenAI Base URL、模型、API Key、PodSuite 地址、集成 Token 和管理 To
 
 ### Docker 运行
 
-[![Docker Image Version](https://img.shields.io/docker/v/alanoo/migpt?color=%23086DCD&label=docker%20image)](https://hub.docker.com/r/alanoo/migpt)
-
-推荐使用以下命令，直接 Docker 一键运行。
-
-```shell
-docker compose up -d
-```
-
-也可以手工运行镜像：
-
-```shell
-docker run -it --rm \
-  -p 4399:4399 -p 4398:4398 \
-  -v migpt-data:/data \
-  alanoo/migpt:latest
+```yaml
+services:
+  migpt:
+    image: alanoo/migpt:latest
+    container_name: migpt
+    restart: unless-stopped
+    ports:
+      - '4398:4398'
+      - '4399:4399'
+    volumes:
+      - /mnt/app/appdata/migpt:/data
 ```
 
 启动后打开 `http://音箱所在主机:4398/`，可以查看音箱连接状态、控制播放（进度、音量、待播清单）、

@@ -195,7 +195,7 @@ export class ControlServer {
   private async playerStatus() {
     return {
       status: await this.speaker.getPlaying(true),
-      current: this.controller.current,
+      current: await this.controller.currentForStatus(),
       playback: await this.speaker.getPlaybackContext().catch(() => ({})),
       timer_until: this.controller.timerUntil || null,
       connection: this.getConnectionStatus?.() || { connected: false },
