@@ -7,6 +7,7 @@ import { OpenXiaoAISpeaker } from "./speaker.js";
 import { randomUUID } from "node:crypto";
 import { PodcastApiClient } from "./podcast/api-client.js";
 import { PodcastController } from "./podcast/controller.js";
+import { SpeedStreamManager, findReachableStreamBase, streamBaseFromServerUrl } from "./podcast/speed-stream.js";
 import { ConversationStore, JsonStore } from "./persistence.js";
 import { ControlServer, type MigptRuntimeConfig } from "./control/http-server.js";
 import { join } from "node:path";
@@ -62,6 +63,11 @@ class OpenXiaoAIEngine extends MiGPTEngine {
   private readonly micArbiter = new MicArbiter(process.env.MIGPT_EXCLUSIVE_MIC !== "0");
   private nativeNlpDisabled = false;
   private connection: MigptConnectionStatus = { connected: false };
+  private controlPort = 4398;
+  private controlConfig?: MigptRuntimeConfig;
+  private configStore?: JsonStore<MigptRuntimeConfig>;
+  /** 倍速流地址的探测结果缓存，避免每次播放/跳转都让音箱请求一次。 */
+  private streamBaseCheckedAt = 0;
   private wakeResumeTimer?: ReturnType<typeof setTimeout>;
   /** 当前这一轮唤醒是否已经暂停了 MiGPT 播放。状态在异步暂停完成前就锁定，
    * 防止 VAD_BEGIN 后马上到达 FINAL 时发生竞态。 */
@@ -114,6 +120,7 @@ class OpenXiaoAIEngine extends MiGPTEngine {
       }),
       OpenXiaoAISpeaker,
       this.conversations,
+      { streams: new SpeedStreamManager({ resolveBaseUrl: () => this.resolveStreamBaseUrl() }) },
     );
     // 注册全局回调函数
     (global as any).RUST_CALLBACKS = {
@@ -146,6 +153,10 @@ class OpenXiaoAIEngine extends MiGPTEngine {
     if (normalizedPersistedConfig) await configStore.save(persisted);
     Object.assign(controlConfig, persisted, { openai: { ...controlConfig.openai, ...persisted.openai }, prompt: { ...controlConfig.prompt, ...persisted.prompt } });
     this.podcastController.updateApi({ baseUrl: controlConfig.podsuiteUrl, token: controlConfig.podsuiteToken });
+    this.podcastController.restoreSpeed(controlConfig.playbackSpeed);
+    this.controlPort = Number(process.env.MIGPT_PORT || controlConfig.port || 4398);
+    this.controlConfig = controlConfig;
+    this.configStore = configStore;
     Object.assign(this.config, { openai: controlConfig.openai, prompt: controlConfig.prompt });
     this.reinitializeChatBot();
     console.log("🤖 AI 配置已加载", {
@@ -171,8 +182,46 @@ class OpenXiaoAIEngine extends MiGPTEngine {
         });
       },
       () => ({ ...this.connection, device: this.connection.device && { ...this.connection.device } }),
+      this.podcastController.streams,
     );
     this.controlServer.listen();
+  }
+
+  /**
+   * 音箱访问 MiGPT 管理服务的地址，倍速音频流由此提供。
+   *
+   * 音箱常经反向代理（wss://域名）连接 MiGPT，容器内也无法得知宿主机的局域网 IP，
+   * 所以不能直接推算，而是收集候选地址，由音箱用 curl 请求健康检查，
+   * 确认指向本实例后才使用。候选顺序：上次成功的地址、管理请求的 Host、
+   * 由音箱 server.txt 推算的地址。环境变量 MIGPT_STREAM_BASE_URL 优先且不探测。
+   * 成功结果写入 config.json，10 分钟内不重复探测。
+   */
+  private async resolveStreamBaseUrl() {
+    const configured = process.env.MIGPT_STREAM_BASE_URL?.trim();
+    if (configured) return configured;
+    const saved = this.controlConfig?.streamBaseUrl;
+    if (saved && Date.now() - this.streamBaseCheckedAt < 10 * 60_000) return saved;
+    const server = await OpenXiaoAISpeaker.runShell("cat /data/open-xiaoai/server.txt 2>/dev/null");
+    const candidates = [
+      saved,
+      ...(this.controlServer?.recentRequestHosts || []).map((host) => `http://${host}`),
+      streamBaseFromServerUrl(server?.stdout.trim().split("\n")[0] || "", this.controlPort),
+    ];
+    // 候选地址已由 normalizeStreamBase 限制为安全字符，可以直接放进单引号。
+    const found = await findReachableStreamBase(candidates, async (healthUrl) => (
+      await OpenXiaoAISpeaker.runShell(`curl -s -m 3 '${healthUrl}' 2>/dev/null`, { timeout: 5_000 })
+    )?.stdout);
+    if (!found) {
+      console.warn("⚠️ 音箱无法访问任何候选 MiGPT 地址，倍速播放不可用", { candidates: candidates.filter(Boolean) });
+      return undefined;
+    }
+    this.streamBaseCheckedAt = Date.now();
+    if (this.controlConfig && found !== saved) {
+      console.log("✅ 已确认音箱访问 MiGPT 的地址，倍速流将使用", found);
+      this.controlConfig.streamBaseUrl = found;
+      await this.configStore?.save(this.controlConfig).catch((error: unknown) => console.warn("⚠️ 保存倍速流地址失败", error));
+    }
+    return found;
   }
 
   /**

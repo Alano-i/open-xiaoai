@@ -5,6 +5,7 @@ import { extname, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { PodcastController } from "../podcast/controller.js";
 import type { PodcastSpeaker } from "../podcast/controller.js";
+import { MIGPT_INSTANCE_ID, type SpeedStreamManager } from "../podcast/speed-stream.js";
 import { JsonStore, ConversationStore } from "../persistence.js";
 import type { MigptConnectionStatus } from "../xiaoai.js";
 
@@ -18,6 +19,10 @@ export interface MigptRuntimeConfig {
   openai: { baseURL: string; apiKey: string; model: string };
   prompt: { system: string };
   devices: Array<Record<string, unknown>>;
+  /** 播客倍速，管理页切换后保存，重启后继续使用。 */
+  playbackSpeed?: number;
+  /** 最近一次探测成功的倍速流地址（音箱能访问到的 MiGPT 管理地址），重启后优先使用。 */
+  streamBaseUrl?: string;
 }
 
 type ConfigPatch = Partial<MigptRuntimeConfig> & { openai?: Partial<MigptRuntimeConfig["openai"]>; prompt?: Partial<MigptRuntimeConfig["prompt"]> };
@@ -40,6 +45,8 @@ const MIME: Record<string, string> = {
 
 export class ControlServer {
   private readonly server;
+  /** 已通过鉴权的管理请求所用的 Host（最近几个），作为倍速流地址的候选。 */
+  private readonly requestHosts: string[] = [];
   constructor(
     private readonly config: MigptRuntimeConfig,
     private readonly configStore: JsonStore<MigptRuntimeConfig>,
@@ -49,6 +56,7 @@ export class ControlServer {
     private readonly webRoot: string,
     private readonly onConfigUpdate?: (config: MigptRuntimeConfig) => void,
     private readonly getConnectionStatus?: () => MigptConnectionStatus,
+    private readonly streams?: SpeedStreamManager,
   ) {
     this.server = createServer((request, response) => {
       void this.handle(request, response).catch((error: unknown) => {
@@ -79,9 +87,12 @@ export class ControlServer {
     }
     if (url.pathname === "/api/migpt/v1/health") {
       response.setHeader("Cache-Control", "no-store");
-      return this.json(response, 200, { ok: true, service: "migpt" });
+      return this.json(response, 200, { ok: true, service: "migpt", instance: MIGPT_INSTANCE_ID });
     }
+    // 倍速音频流供音箱拉取，音箱无法附加 Authorization 头；地址只认随机会话 ID。
+    if (this.streams?.handle(request, response, url.pathname)) return;
     if (url.pathname.startsWith("/api/") && !this.authorized(request)) return this.json(response, 401, { error: "未授权" });
+    if (url.pathname.startsWith("/api/")) this.rememberHost(request.headers.host);
     if ((url.pathname === "/api/migpt/v1/status" || url.pathname === "/api/migpt/v1/player") && request.method === "GET") {
       return this.json(response, 200, await this.playerStatus());
     }
@@ -152,6 +163,15 @@ export class ControlServer {
         if (!Number.isFinite(volume)) return this.json(response, 400, { error: "音量必须是 0-100 的数字" });
         return this.json(response, 200, { success: await this.speaker.setVolume?.(volume) ?? false });
       }
+      if (request.method === "POST" && command === "speed") {
+        const body = await this.body<{ speed?: number }>(request);
+        const result = await this.controller.setSpeed(Number(body.speed));
+        if (result.speed !== this.config.playbackSpeed) {
+          this.config.playbackSpeed = result.speed;
+          await this.configStore.save(this.config);
+        }
+        return this.json(response, 200, result);
+      }
       const commands: Record<string, string> = { pause: "暂停播客", resume: "继续播放", stop: "停止播客", next: "播放下一集", previous: "播放上一集", restart: "从头播放播客" };
       if (request.method === "POST" && command && commands[command]) {
         const result = await this.controller.handle(commands[command]);
@@ -178,6 +198,20 @@ export class ControlServer {
     return this.static(url.pathname, response);
   }
 
+  /**
+   * PodSuite 代理或浏览器访问管理接口时用的地址（如 10.10.10.10:4398）往往也是音箱能访问的地址，
+   * 记录下来供倍速流探测；是否可用由音箱实际探测决定。
+   */
+  private rememberHost(host: string | undefined) {
+    if (!host) return;
+    const index = this.requestHosts.indexOf(host);
+    if (index >= 0) this.requestHosts.splice(index, 1);
+    this.requestHosts.unshift(host);
+    this.requestHosts.splice(5);
+  }
+
+  get recentRequestHosts() { return [...this.requestHosts]; }
+
   /** 转发 PodSuite 查询；PodSuite 未配置或不可用时返回 502 和具体原因，而不是笼统的“请求格式无效”。 */
   private async forwardPodsuite(response: ServerResponse, load: () => Promise<unknown>) {
     try {
@@ -196,7 +230,8 @@ export class ControlServer {
     return {
       status: await this.speaker.getPlaying(true),
       current: await this.controller.currentForStatus(),
-      playback: await this.speaker.getPlaybackContext().catch(() => ({})),
+      playback: this.controller.playbackForStatus(await this.speaker.getPlaybackContext().catch(() => ({}))),
+      speed: this.controller.speed,
       timer_until: this.controller.timerUntil || null,
       connection: this.getConnectionStatus?.() || { connected: false },
     };

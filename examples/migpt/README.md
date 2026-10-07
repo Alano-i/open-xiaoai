@@ -109,5 +109,18 @@ pnpm dev
    `packages/client-rust/target/armv7-unknown-linux-gnueabihf/release/client`。
    覆盖后还必须重启音箱上的 Client 进程；仅执行 `dd` 不会让已运行的进程加载新代码。
 
+7. 播客倍速（1×/1.3×/1.5×/1.8×/2×/2.5×/3×，在管理页“正在播放”卡片左侧切换）：
+   音箱固件不支持变速，倍速由 MiGPT 用 ffmpeg 的 `atempo`（变速不变调）实时转码为 MP3，
+   音箱播放 `http://<MiGPT 主机>:4398/stream/<会话ID>.mp3`。Docker 镜像已内置精简版 ffmpeg；
+   本机直接运行时需自行安装 ffmpeg（可用 `MIGPT_FFMPEG` 指定路径）。1× 仍直接播放原始音频。
+   - 流地址自动探测：候选为上次成功的地址、访问管理接口时使用的地址（如 PodSuite 里填写的
+     `http://192.168.1.10:4398`）、由音箱 `/data/open-xiaoai/server.txt` 推算的地址
+     （`ws://主机:4399` → `http://主机:4398`，`wss://域名` → `https://域名`）。MiGPT 让音箱用 curl
+     逐个请求健康检查，确认指向本实例后才使用，结果保存到 `config.json` 的 `streamBaseUrl`。
+     音箱经 `wss://` 反向代理连接时，打开一次管理页（或 PodSuite 助手页）即可探测到局域网地址。
+     都不可达时可设置 `MIGPT_STREAM_BASE_URL`（音箱能访问到的 MiGPT 管理地址），设置后不再探测。
+   - 倍速流无法按字节定位，拖动进度或切换倍速时会从目标位置重新拉流，可能有约 1 秒的切换间隙。
+   - ffmpeg 不可用或无法确定流地址时自动按原速播放，管理页会提示原因。
+
 > [!NOTE]
 > 本项目只是一个简单的演示程序，抛砖引玉。如果你想要更多的功能，比如唤醒词识别、语音转文字、连续对话等（甚至是对接 OpenAI 的 [Realtime API](https://platform.openai.com/docs/guides/realtime)），可参考本项目代码自行实现。

@@ -2,6 +2,7 @@
 import { sleep } from "@mi-gpt/utils";
 import { chineseNumber, parsePodcastCommand, type PodcastIntent } from "./command-parser.js";
 import { PodcastApiClient } from "./api-client.js";
+import { PLAYBACK_SPEEDS, isSupportedSpeed, type SpeedStreamManager } from "./speed-stream.js";
 import type { Episode } from "./types.js";
 
 export interface PodcastSpeaker {
@@ -31,6 +32,21 @@ export interface PodcastHandleResult {
   failed?: boolean;
 }
 
+/**
+ * 当前正在播放的倍速流。音箱上报的位置是流内时间，
+ * 原始位置 = baseMs + 流内位置 × speed；原速直连播放时为 undefined。
+ */
+interface ActiveStream {
+  audioId: string;
+  speed: number;
+  baseMs: number;
+}
+
+export interface PodcastControllerOptions {
+  /** 倍速转码服务；未提供时只能原速播放。 */
+  streams?: SpeedStreamManager;
+}
+
 interface LocalState {
   current?: Episode;
   pendingQuery?: string;
@@ -41,6 +57,23 @@ interface LocalState {
 
 const state: LocalState = {};
 let timer: ReturnType<typeof setTimeout> | undefined;
+
+/** 开始播放（含跳转、切换倍速）后，播放器装载新音频期间仍会上报旧音频，完播检测在此时间内继续等待。 */
+const PLAYBACK_LOAD_WINDOW_MS = 10_000;
+/** 倍速播放时目标位置距结尾不足这么多毫秒就直接按播完处理：ffmpeg 从结尾转码几乎没有内容，播放器会拿不到音频。 */
+const STREAM_END_MARGIN_MS = 2_000;
+
+/** 断点距结尾不足这么多毫秒时视为已播完，续播改为从头开始（从结尾续播听不到内容，倍速流还会转码出空音频）。 */
+const END_RESUME_MARGIN_MS = 5_000;
+
+/** 续播的起始位置：已完成或断点已在结尾附近时从头播放。 */
+function resumePosition(episode: Episode) {
+  const progress = episode.progress;
+  if (!progress || progress.status === "completed") return 0;
+  const position = Number(progress.position_ms || 0);
+  const duration = Number(episode.duration_ms || progress.duration_ms || 0);
+  return duration > 0 && position >= duration - END_RESUME_MARGIN_MS ? 0 : position;
+}
 
 function contextNumber(context: Record<string, unknown>, names: string[]): number | undefined {
   for (const name of names) {
@@ -64,13 +97,26 @@ export class PodcastController {
   private completionGeneration = 0;
   private speechTail: Promise<void> = Promise.resolve();
   private speechGeneration = 0;
+  readonly streams?: SpeedStreamManager;
+  /** 用户选择的倍速，对之后开始的每一次播放生效。 */
+  private desiredSpeed = 1;
+  private activeStream?: ActiveStream;
+  /**
+   * 暂停期间切换了倍速或拖动了进度：转码流无法原地变速或跳转，
+   * 继续播放时需要从 PodSuite 保存的断点重新拉流。
+   */
+  private restartOnResume = false;
+  /** 最近一次下发播放的时间，用于判断播放器是否仍在装载新音频。 */
+  private playStartedAt = 0;
 
   constructor(
     api: PodcastApiClient,
     private readonly speaker: PodcastSpeaker,
     private readonly conversations?: ConversationSink,
+    options: PodcastControllerOptions = {},
   ) {
     this.api = api;
+    this.streams = options.streams;
     // 播放中每 15 秒上报一次位置，异常断电也能在最近位置续播。
     const progressTimer = setInterval(() => {
       void this.speaker.getPlaying(true).then((status) => {
@@ -103,6 +149,56 @@ export class PodcastController {
     ]);
   }
   get timerUntil() { return state.timerUntil; }
+
+  get speed() { return this.desiredSpeed; }
+
+  /** 音箱里当前这段音频的实际倍速：原速直连（含倍速不可用时的回退、MiGPT 重启前加载的音频）为 1。 */
+  private get playingSpeed() { return this.activeStream?.speed ?? 1; }
+
+  /**
+   * 启动时恢复 config.json 中保存的倍速，不影响正在进行的播放。
+   * 旧版本的档位（如 1.25、1.33、1.75）已不在列表中，换成最接近的档位。
+   */
+  restoreSpeed(speed: unknown) {
+    if (typeof speed !== "number" || !Number.isFinite(speed)) return;
+    this.desiredSpeed = PLAYBACK_SPEEDS.reduce((best, item) => (
+      Math.abs(item - speed) < Math.abs(best - speed) ? item : best
+    ), PLAYBACK_SPEEDS[0] as number);
+  }
+
+  /**
+   * 切换倍速。播放中立即从当前位置按新倍速重新拉流；暂停时只记录，
+   * 继续播放时再生效（见 resume）；空闲时对下一次播放生效。
+   * 设置值与音箱里实际倍速不一致时（如 MiGPT 重启后），重选同一档位也会重新拉流。
+   */
+  async setSpeed(speed: number): Promise<PodcastHandleResult & { speed: number }> {
+    if (!isSupportedSpeed(speed)) return { ...this.fail("不支持该倍速。", false), speed: this.desiredSpeed };
+    if (speed === this.desiredSpeed && speed === this.playingSpeed) return { handled: true, speed };
+    this.desiredSpeed = speed;
+    const current = state.current;
+    if (!current) return { handled: true, speed };
+    const status = await this.speaker.getPlaying(true);
+    if (status !== "playing") return { handled: true, speed };
+    const progress = await this.saveCurrentProgress("playing");
+    const position = progress?.position_ms ?? Number(current.progress?.position_ms || 0);
+    const result = await this.playFrom(current, position);
+    return { ...result, speed };
+  }
+
+  /**
+   * 状态接口返回的播放器上下文：倍速播放时把流内位置、时长换算成原始音频时间，
+   * 管理页无需关心是否经过转码。
+   */
+  playbackForStatus(context: Record<string, unknown>) {
+    const current = state.current;
+    if (!current || (!this.activeStream && !this.restartOnResume && !this.isForeignAudio(context))) return context;
+    // 播放器里是别的音频（或新流尚未装载）时显示 PodSuite 保存的断点。
+    const position = this.restartOnResume
+      ? Number(current.progress?.position_ms || 0)
+      : this.positionFrom(context) ?? Number(current.progress?.position_ms || 0);
+    const duration = this.durationFrom(context, current);
+    return { ...context, position_ms: position, duration_ms: duration ?? null };
+  }
 
   updateApi(config: { baseUrl: string; token?: string }) {
     this.api.updateConfig(config);
@@ -313,18 +409,61 @@ export class PodcastController {
   private async startEpisode(episode: Episode, fromStart = false, announce = true) {
     // 切换节目之前立即保存旧节目的位置，避免用户连续说“下一集”或直接点播
     // 时还没等到 15 秒进度上报就丢失断点。
-    if (state.current && state.current.episode_id !== episode.episode_id) {
+    // 已标记完成的节目（自然播完后自动下一集）不能再保存：播放器此时停在结尾，
+    // 会把“已完成”覆盖成结尾处的“暂停”，之后按上一集就会从结尾续播而播不出声音。
+    if (state.current && state.current.episode_id !== episode.episode_id && state.current.progress?.status !== "completed") {
       // 进度上报不应阻塞下一集的播放；网络异常时也不能让语音指令卡住。
       void this.saveCurrentProgress("paused");
     }
     this.cancelCompletion();
     state.current = episode;
-    const position = fromStart || episode.progress?.status === "completed"
-      ? 0
-      : Number(episode.progress?.position_ms || 0);
+    const position = fromStart ? 0 : resumePosition(episode);
     if (announce) {
       await this.enqueueSpeak(`好的，${position > 0 ? "继续播放" : "正在播放"}《${episode.podcast_title}》第${episode.season}季第${episode.episode}集。`);
     }
+    return this.playFrom(episode, position);
+  }
+
+  /**
+   * 从原始音频的 position 处开始播放 episode。倍速不为 1 时播放 ffmpeg 转码流
+   * （流本身就从 position 开始，不需要 seek）；倍速流不可用时回退到原速，
+   * 播放照常进行，只在结果中提示原因。
+   */
+  private async playFrom(episode: Episode, position: number): Promise<PodcastHandleResult> {
+    this.cancelCompletion();
+    this.restartOnResume = false;
+    this.playStartedAt = Date.now();
+    const speed = this.desiredSpeed;
+    let fallbackReason: string | undefined;
+    const sourceDuration = this.durationFrom({}, episode);
+    if (speed !== 1 && this.streams && sourceDuration && position >= sourceDuration - STREAM_END_MARGIN_MS) {
+      // 拖到结尾（或在最后两秒切换倍速）：按播完处理并进入下一集。
+      await this.finishEpisode(episode, await this.speaker.getPlaying(true));
+      return { handled: true };
+    }
+    if (speed !== 1 && this.streams) {
+      const stream = await this.streams.create(episode.audio_url, position, speed).catch((error: unknown) => {
+        fallbackReason = error instanceof Error ? error.message : String(error);
+        console.warn("⚠️ 倍速流创建失败，改为原速播放", fallbackReason);
+        return undefined;
+      });
+      if (stream) {
+        // 先登记新流再下发播放：期间到达的旧流位置因 audio_id 不同会被忽略。
+        this.activeStream = { audioId: stream.audioId, speed, baseMs: position };
+        const total = episode.duration_ms ?? undefined;
+        const played = await this.speaker.play({
+          url: stream.url,
+          audioId: stream.audioId,
+          durationMs: total ? Math.max(0, (total - position) / speed) : null,
+        });
+        if (!played) return this.fail("音频播放失败，请检查音箱和播客地址。");
+        if (total) this.scheduleCompletion(position, total);
+        return { handled: true };
+      }
+    } else if (speed !== 1) {
+      fallbackReason = "MiGPT 未启用倍速转码";
+    }
+    this.activeStream = undefined;
     const played = await this.speaker.play({
       url: episode.audio_url,
       audioId: episode.episode_id,
@@ -337,7 +476,43 @@ export class PodcastController {
     const reportedDuration = contextNumber(context || {}, ["duration_ms", "duration", "audio_length", "length"]);
     const duration = reportedDuration && reportedDuration > 0 ? reportedDuration : episode.duration_ms ?? undefined;
     if (duration) this.scheduleCompletion(position, duration);
-    return { handled: true };
+    return fallbackReason
+      ? { handled: true, failed: true, text: `${fallbackReason}，已按原速播放。` }
+      : { handled: true };
+  }
+
+  /**
+   * 播放器里是不是别的音频：原生小爱的音乐、其他 URL，或新节目/新倍速流尚未装载时残留的上一段音频。
+   * 这时上下文里的位置和时长都与当前播客无关，不能用来保存断点或判断完播，
+   * 否则会把别的音频的进度写进当前播客。固件未上报 audio_id 时无法判断，按当前播客处理。
+   */
+  private isForeignAudio(
+    context: Record<string, unknown>,
+    episode = state.current,
+    stream = this.activeStream,
+  ) {
+    const audioId = String(context.audio_id || context.audioId || "");
+    const expected = stream?.audioId ?? episode?.episode_id;
+    return Boolean(audioId && expected && audioId !== expected);
+  }
+
+  /**
+   * 播放器上下文中的原始音频位置；播放器里是别的音频时返回 undefined。
+   * episode/stream 默认取当前状态；异步保存进度时须传入调用时的值，避免切集后错判。
+   */
+  private positionFrom(context: Record<string, unknown>, episode = state.current, stream = this.activeStream) {
+    if (this.isForeignAudio(context, episode, stream)) return undefined;
+    const raw = contextNumber(context, ["position_ms", "position", "audio_pos", "pos"]);
+    if (!stream || raw === undefined) return raw;
+    return Math.round(stream.baseMs + raw * stream.speed);
+  }
+
+  /** 原始音频总时长。倍速流的时长是转码后的流长度，不能直接使用，改用节目元数据或 ffmpeg 解析值。 */
+  private durationFrom(context: Record<string, unknown>, episode: Episode, stream = this.activeStream) {
+    if (stream) return episode.duration_ms ?? this.streams?.sourceDuration(stream.audioId) ?? undefined;
+    if (this.isForeignAudio(context, episode, stream)) return episode.duration_ms ?? undefined;
+    const reported = contextNumber(context, ["duration_ms", "duration", "audio_length", "length"]);
+    return reported && reported > 0 ? reported : episode.duration_ms ?? undefined;
   }
 
   /**
@@ -346,8 +521,9 @@ export class PodcastController {
    */
   async seek(positionMs: number) {
     const target = Math.max(0, Math.round(positionMs));
-    const success = await this.speaker.seek(target).catch(() => false);
     const current = state.current;
+    if (current && (this.activeStream || this.restartOnResume)) return this.seekStream(current, target);
+    const success = await this.speaker.seek(target).catch(() => false);
     if (!success || !current) return { success };
     const status = await this.speaker.getPlaying(true);
     const progress = await this.saveCurrentProgress(status === "playing" ? "playing" : "paused");
@@ -355,6 +531,26 @@ export class PodcastController {
     if (status === "playing" && duration) this.scheduleCompletion(target, duration);
     else this.cancelCompletion();
     return { success };
+  }
+
+  /** 倍速流无法按字节跳转：播放中从目标位置重新拉流，暂停时记录断点、继续播放时生效。 */
+  private async seekStream(current: Episode, target: number) {
+    const status = await this.speaker.getPlaying(true);
+    if (status === "playing") {
+      const result = await this.playFrom(current, target);
+      return { success: result.handled && !result.failed };
+    }
+    this.cancelCompletion();
+    const progress = await this.api.saveProgress(current.episode_id, {
+      position_ms: target,
+      duration_ms: this.durationFrom({}, current),
+      status: "paused",
+      device_id: process.env.MIGPT_DEVICE_ID || "",
+    }).catch(() => undefined);
+    if (!progress) return { success: false };
+    if (state.current?.episode_id === current.episode_id) state.current.progress = progress;
+    this.restartOnResume = true;
+    return { success: true };
   }
 
   private async preparePlayback(episodeId: string, positionMs: number) {
@@ -404,6 +600,12 @@ export class PodcastController {
         episode: state.current.episode,
       });
     }
+    if (this.restartOnResume || this.playingSpeed !== this.desiredSpeed) {
+      // 暂停期间改了倍速或进度（或 MiGPT 重启后音箱里仍是原速音频），
+      // 旧音频不能直接继续，从保存的断点按当前倍速重新拉流。
+      const result = await this.playFrom(state.current, Number(state.current.progress?.position_ms || 0));
+      return result.failed ? result : this.reply("继续播放。", false);
+    }
     await this.speaker.setPlaying(true);
     const progress = await this.saveCurrentProgress("playing");
     if (progress?.duration_ms) this.scheduleCompletion(progress.position_ms, progress.duration_ms);
@@ -419,6 +621,7 @@ export class PodcastController {
     await this.ensureCurrent();
     await this.saveCurrentProgress("stopped", await contextPromise);
     this.cancelCompletion();
+    this.clearStream();
     return this.reply("已停止播放。", false);
   }
 
@@ -459,6 +662,7 @@ export class PodcastController {
     timer = setTimeout(async () => {
       await this.saveCurrentProgress("timer_stopped");
       this.cancelCompletion();
+      this.clearStream();
       await this.speaker.stop();
       state.timerUntil = undefined;
       timer = undefined;
@@ -474,12 +678,19 @@ export class PodcastController {
   }
 
   private async saveCurrentProgress(status: string, context?: Record<string, unknown>) {
+    // 同步记下调用时的节目和倍速流：切集时本方法不等待就继续播放新节目，
+    // 读到播放器上下文时 state.current 可能已经是下一集。
     const current = state.current;
+    const stream = this.activeStream;
+    const restartOnResume = this.restartOnResume;
     if (!current) return;
     const playbackContext = context || await this.speaker.getPlaybackContext().catch(() => ({}));
-    const position = contextNumber(playbackContext, ["position_ms", "position", "audio_pos", "pos"]) ?? Number(current.progress?.position_ms || 0);
-    const reportedDuration = contextNumber(playbackContext, ["duration_ms", "duration", "audio_length", "length"]);
-    const duration = reportedDuration && reportedDuration > 0 ? reportedDuration : current.duration_ms ?? undefined;
+    // 播放器里是别的音频时不上报，保留 PodSuite 中已有的断点。
+    if (this.isForeignAudio(playbackContext, current, stream)) return undefined;
+    // 暂停期间拖动过进度时，播放器里仍是旧位置，以已保存的目标断点为准。
+    const position = (restartOnResume ? undefined : this.positionFrom(playbackContext, current, stream))
+      ?? Number(current.progress?.position_ms || 0);
+    const duration = this.durationFrom(playbackContext, current, stream);
     const progress = await this.api.saveProgress(current.episode_id, {
       position_ms: position,
       duration_ms: duration,
@@ -488,6 +699,12 @@ export class PodcastController {
     }).catch(() => undefined);
     if (progress && state.current?.episode_id === current.episode_id) state.current.progress = progress;
     return progress;
+  }
+
+  /** 播放器已停止：断点已保存到 PodSuite，之后的状态和续播都以保存的断点为准。 */
+  private clearStream() {
+    this.activeStream = undefined;
+    this.restartOnResume = false;
   }
 
   private cancelCompletion() {
@@ -500,7 +717,8 @@ export class PodcastController {
     this.cancelCompletion();
     if (durationMs <= 0 || positionMs >= durationMs) return;
     const generation = this.completionGeneration;
-    const delay = Math.max(250, durationMs - positionMs - 2_000);
+    // 倍速播放时剩余的真实时间按倍速缩短。
+    const delay = Math.max(250, (durationMs - positionMs) / (this.activeStream?.speed ?? 1) - 2_000);
     this.completionTimer = setTimeout(() => void this.checkCompletion(generation, positionMs), delay);
     this.completionTimer.unref();
   }
@@ -509,24 +727,23 @@ export class PodcastController {
     if (generation !== this.completionGeneration || !state.current) return;
     const status = await this.speaker.getPlaying(true);
     const context = await this.speaker.getPlaybackContext().catch(() => ({} as Record<string, unknown>));
-    const position = contextNumber(context, ["position_ms", "position", "audio_pos", "pos"]);
-    const reportedDuration = contextNumber(context, ["duration_ms", "duration", "audio_length", "length"]);
-    const duration = reportedDuration && reportedDuration > 0 ? reportedDuration : state.current.duration_ms ?? undefined;
+    if (this.isForeignAudio(context)) {
+      // 刚开始播放或跳转后，播放器还在装载新音频（倍速流尤其明显），上报的仍是旧音频：
+      // 继续等待，否则拖到结尾附近时完播检测会就此中断，播完也不会进入下一集。
+      // 超过装载时间仍是别的音频，说明播客已被替换（如用户让原生小爱放音乐），不再判定完播。
+      if (Date.now() - this.playStartedAt < PLAYBACK_LOAD_WINDOW_MS && generation === this.completionGeneration) {
+        this.completionTimer = setTimeout(() => void this.checkCompletion(generation, previousPosition), 200);
+        this.completionTimer.unref();
+      }
+      return;
+    }
+    const position = this.positionFrom(context);
+    const duration = this.durationFrom(context, state.current);
     const naturallyFinished = Boolean(duration && previousPosition > duration * 0.8 && (
       status === "idle" || position === undefined || position >= duration - 150 || position + 1_000 < previousPosition
     ));
     if (naturallyFinished) {
-      const progress = await this.api.complete(state.current.episode_id, process.env.MIGPT_DEVICE_ID || "").catch(() => undefined);
-      if (progress) state.current.progress = progress;
-      this.cancelCompletion();
-      // 设置了定时停止时，当前节目播完即停，不跨集继续播放；定时器仍由
-      // setTimer 管理。未设置定时器则无缝衔接下一集，直到 PodSuite 找不到
-      // 后续节目为止。pause/stop 会提前 cancelCompletion，因此不会误触发。
-      if (!state.timerUntil) {
-        const advanced = await this.advanceAfterCompletion(state.current);
-        if (advanced) return;
-      }
-      if (status !== "idle") await this.speaker.stop();
+      await this.finishEpisode(state.current, status);
       return;
     }
     if (status !== "playing") return;
@@ -536,6 +753,21 @@ export class PodcastController {
       100,
     );
     this.completionTimer.unref();
+  }
+
+  /** 标记本集完成，并自动进入下一集；设置了定时停止或没有下一集时停止播放。 */
+  private async finishEpisode(episode: Episode, status: "playing" | "paused" | "idle") {
+    this.cancelCompletion();
+    const progress = await this.api.complete(episode.episode_id, process.env.MIGPT_DEVICE_ID || "").catch(() => undefined);
+    if (progress && state.current?.episode_id === episode.episode_id) state.current.progress = progress;
+    // 设置了定时停止时，当前节目播完即停，不跨集继续播放；定时器仍由
+    // setTimer 管理。未设置定时器则无缝衔接下一集，直到 PodSuite 找不到
+    // 后续节目为止。pause/stop 会提前 cancelCompletion，因此不会误触发。
+    if (!state.timerUntil) {
+      const advanced = await this.advanceAfterCompletion(state.current || episode);
+      if (advanced) return;
+    }
+    if (status !== "idle") await this.speaker.stop();
   }
 
   /** 自然播放结束后的静默自动续播，不播报“下一集”提示音，避免集与集之间断音。 */
@@ -576,8 +808,8 @@ export class PodcastController {
   }
 
   /** 指令未执行时的回复：照常播报给音箱，同时标记 failed 供管理页区分提示样式。 */
-  private fail(text: string): PodcastHandleResult {
-    return { ...this.reply(text, true), failed: true };
+  private fail(text: string, speak = true): PodcastHandleResult {
+    return { ...this.reply(text, speak), failed: true };
   }
 
   private reply(text: string, speak = true) {
