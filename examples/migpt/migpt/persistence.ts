@@ -26,13 +26,15 @@ export class JsonStore<T extends object> {
   }
 }
 
+/** 对话记录只保留最近 limit 条（默认 100），超过时删除最早的，避免 conversations.json 越来越大。 */
 export class ConversationStore {
   private entries: Array<Record<string, unknown>> = [];
-  constructor(private readonly file: string, private readonly limit = 500) {}
+  constructor(private readonly file: string, private readonly limit = 100) {}
   async load() {
     try {
       const parsed = JSON.parse(await readFile(this.file, "utf8"));
-      if (Array.isArray(parsed)) this.entries = parsed;
+      // 旧版本最多保存 500 条，加载时就按新上限裁剪，不必等到下一条记录写入。
+      if (Array.isArray(parsed)) this.entries = parsed.slice(-this.limit);
     } catch (_) { /* ignore */ }
   }
   append(entry: Record<string, unknown>) {
