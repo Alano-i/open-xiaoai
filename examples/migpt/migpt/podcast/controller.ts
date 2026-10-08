@@ -755,18 +755,16 @@ export class PodcastController {
     this.completionTimer.unref();
   }
 
-  /** 标记本集完成，并自动进入下一集；设置了定时停止或没有下一集时停止播放。 */
+  /** 标记本集完成，并自动进入下一集；没有下一集时停止播放。 */
   private async finishEpisode(episode: Episode, status: "playing" | "paused" | "idle") {
     this.cancelCompletion();
     const progress = await this.api.complete(episode.episode_id, process.env.MIGPT_DEVICE_ID || "").catch(() => undefined);
     if (progress && state.current?.episode_id === episode.episode_id) state.current.progress = progress;
-    // 设置了定时停止时，当前节目播完即停，不跨集继续播放；定时器仍由
-    // setTimer 管理。未设置定时器则无缝衔接下一集，直到 PodSuite 找不到
-    // 后续节目为止。pause/stop 会提前 cancelCompletion，因此不会误触发。
-    if (!state.timerUntil) {
-      const advanced = await this.advanceAfterCompletion(state.current || episode);
-      if (advanced) return;
-    }
+    // 无缝衔接下一集，直到 PodSuite 找不到后续节目为止。定时停止只在到点时由
+    // setTimer 的定时器停止播放，不影响到点前的连播（此前设置定时后播完一集就停）。
+    // pause/stop 会提前 cancelCompletion，因此不会误触发。
+    const advanced = await this.advanceAfterCompletion(state.current || episode);
+    if (advanced) return;
     if (status !== "idle") await this.speaker.stop();
   }
 
@@ -780,7 +778,8 @@ export class PodcastController {
     if (!next && current.next_episode_id) {
       next = await this.api.getEpisode(current.next_episode_id).catch(() => undefined);
     }
-    if (!next) return false;
+    // 查到的“下一集”就是当前这集时（模糊匹配或数据异常），按没有下一集处理，避免无限重播同一集。
+    if (!next || next.episode_id === current.episode_id) return false;
     console.log("▶️ 当前节目已播完，自动播放下一集", {
       podcast: current.podcast_title,
       from: `${current.season}-${current.episode}`,

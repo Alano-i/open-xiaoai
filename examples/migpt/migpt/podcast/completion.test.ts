@@ -1,11 +1,14 @@
-/** OH2P 单节目列表会循环，控制器必须在自然结束时主动停止。 */
+/**
+ * OH2P 单节目列表会循环，控制器必须在自然结束时主动停止：没有下一集，
+ * 或查到的“下一集”就是当前这集时，都要标记完成并停止，而不是循环重播。
+ */
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { PodcastApiClient } from "./api-client.js";
 import { PodcastController, type PodcastSpeaker } from "./controller.js";
 import type { Episode, Progress } from "./types.js";
 
-test("节目自然结束后标记完成并停止播放器", async () => {
+async function playToEnd(nextLookup: "none" | "same") {
   const episode: Episode = {
     episode_id: "short-episode",
     podcast_id: "short-podcast",
@@ -18,7 +21,12 @@ test("节目自然结束后标记完成并停止播放器", async () => {
   };
   let completed = false;
   const api = {
-    async resolveEpisode() { return episode; },
+    // 与真实 PodSuite 一致：按季集精确查询，查不到时返回空列表。
+    // "same" 模拟模糊匹配把“第2集”也查成了当前这集。
+    async resolveEpisode(_query: string, _season?: number, number?: number) {
+      if (number === 1 || nextLookup === "same") return episode;
+      return [];
+    },
     async getHistory() { return []; },
     async complete(episodeId: string) {
       completed = true;
@@ -63,4 +71,8 @@ test("节目自然结束后标记完成并停止播放器", async () => {
   assert.equal(completed, true);
   assert.equal(stopped, true);
   assert.equal(controller.current?.progress?.status, "completed");
-});
+}
+
+test("节目自然结束后标记完成并停止播放器", () => playToEnd("none"));
+
+test("查到的下一集就是当前这集时停止播放，不循环重播", () => playToEnd("same"));

@@ -333,6 +333,27 @@ test("倍速播放中拖到最末尾：不再转码空音频，直接标记完�
   assert.deepEqual(h.created.at(-1), { url: h.nextEpisode.audio_url, startMs: 0, speed: 1.5 });
 });
 
+test("设置定时停止后，到点前倍速播完一集仍自动进入下一集", async () => {
+  const h = createHarness();
+  h.episode.duration_ms = 40_000;
+  h.episode.progress = { episode_id: "episode-1", position_ms: 33_000, duration_ms: 40_000, status: "paused" };
+  await h.controller.setSpeed(2);
+  await h.controller.playEpisode("episode-1");
+  await h.controller.handle("30分钟后停止播放");
+  assert.ok(h.controller.timerUntil, "应已设置定时停止");
+  try {
+    h.setContext({ audio_id: "speed-1", position: 3_500 });
+    h.setStatus("idle");
+    await new Promise((resolve) => setTimeout(resolve, 1_800));
+    assert.deepEqual(h.completed, ["episode-1"]);
+    assert.equal(h.controller.current?.episode_id, "episode-2", "定时未到点时应继续播放下一集");
+    assert.deepEqual(h.created.at(-1), { url: h.nextEpisode.audio_url, startMs: 0, speed: 2 });
+    assert.ok(h.controller.timerUntil, "进入下一集后定时停止仍然有效");
+  } finally {
+    await h.controller.handle("取消定时停止");
+  }
+});
+
 test("由音箱连接地址推算倍速流候选地址", () => {
   assert.equal(streamBaseFromServerUrl("ws://192.168.1.10:4399", 4398), "http://192.168.1.10:4398");
   assert.equal(streamBaseFromServerUrl("ws://migpt.lan:4399/", 4398), "http://migpt.lan:4398");
